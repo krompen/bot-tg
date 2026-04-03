@@ -1,30 +1,106 @@
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import datetime
+import random
 
-# ТВОЙ ТОКЕН
-TOKEN = "8612518554:AAEHLo932IWNFCRyDjWJkhagMFXVhpn2cc8"
+TOKEN = "8774801468:AAFkO6626Ifj5LAGQwGWl3xuJUD6UbTs2p4"
 
-# Команда /start
+# Приветствие новых пользователей
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Привет! Я бот и работаю!")
+    user = update.effective_user
+    await update.message.reply_text(
+        f"🤝 Привет, {user.first_name}!\n\n"
+        f"Я — твой личный бот. Вот что я умею:\n"
+        f"/help — список команд\n"
+        f"/time — текущее время\n"
+        f"/joke — случайная шутка\n"
+        f"/advice — совет на сегодня\n\n"
+        f"А ещё я отвечаю на \"привет\", \"как дела\" и \"пока\".",
+        reply_markup=main_keyboard()
+    )
+
+# Клавиатура с кнопками
+def main_keyboard():
+    keyboard = [
+        ["🕒 Время", "😂 Шутка"],
+        ["📝 Совет", "❓ Помощь"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 # Команда /help
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📌 Доступные команды:\n/start - приветствие\n/help - помощь")
+    await update.message.reply_text(
+        "📌 Доступные команды:\n"
+        "/start — приветствие\n"
+        "/help — помощь\n"
+        "/time — текущее время\n"
+        "/joke — случайная шутка\n"
+        "/advice — совет\n\n"
+        "Также можешь использовать кнопки внизу экрана."
+    )
 
-# Ответ на любое сообщение
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    await update.message.reply_text(f"Ты написал: {user_text}")
+# Команда /time
+async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.datetime.now().strftime("%H:%M:%S")
+    await update.message.reply_text(f"🕒 Текущее время: {now}")
+
+# Команда /joke
+async def joke_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    jokes = [
+        "🤣 Почему программисты путают Хэллоуин и Рождество? Потому что 31 Oct = 25 Dec!",
+        "😁 Сколько программистов нужно, чтобы закрутить лампочку? Ни одного, это аппаратная проблема.",
+        "😂 — Дорогой, ты меня любишь?\n— true\n— ???",
+        "🤪 Айтишник у врача:\n— У меня windows, всё время зависает.\n— А вы пробовали перезагрузиться?",
+        "🥴 Два админа спорят, у кого работа сложнее. Первый: \"У меня пользователи...\"\nВторой: \"Всё понял, ты победил\"."
+    ]
+    await update.message.reply_text(random.choice(jokes))
+
+# Команда /advice
+async def advice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    advices = [
+        "💡 Выпей стакан воды прямо сейчас.",
+        "💡 Сделай глубокий вдох и выдох. Спокойствие.",
+        "💡 Отложи телефон на 10 минут. Отдохни.",
+        "💡 Никто не идеален. И это нормально.",
+        "💡 Ты уже сделал сегодня что-то хорошее. Даже просто встав с кровати."
+    ]
+    await update.message.reply_text(random.choice(advices))
+
+# Обработка текстовых сообщений (кнопки и фразы)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.lower()
+
+    if text in ["🕒 время", "/time"]:
+        await time_command(update, context)
+    elif text in ["😂 шутка", "/joke"]:
+        await joke_command(update, context)
+    elif text in ["📝 совет", "/advice"]:
+        await advice_command(update, context)
+    elif text in ["❓ помощь", "/help"]:
+        await help_command(update, context)
+    elif text in ["привет", "здарова", "ку"]:
+        await update.message.reply_text("👋 И тебе привет! Как настроение?")
+    elif "как дела" in text:
+        await update.message.reply_text("У меня всё отлично, работаю в поте лица 🤖 А у тебя?")
+    elif text in ["пока", "до свидания"]:
+        await update.message.reply_text("👋 Пока! Заходи ещё, всегда рад поболтать.")
+    else:
+        await update.message.reply_text(
+            "❓ Не понял команду.\n"
+            "Напиши /help или используй кнопки."
+        )
 
 # Запуск бота
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    
-    print("✅ Бот запущен и слушает сообщения...")
+    app.add_handler(CommandHandler("time", time_command))
+    app.add_handler(CommandHandler("joke", joke_command))
+    app.add_handler(CommandHandler("advice", advice_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("✅ Бот запущен с новыми ништяками")
     app.run_polling()
 
 if __name__ == "__main__":
