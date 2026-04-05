@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ========== КОНФИГ ==========
-TOKEN = "8769635842:AAFVXgtl4g1pkv46jY4jVHEobwjWpWyaGYY"
+TOKEN = "8705854208:AAEIEA7lZWylpBj5pK53Njej8wS1T9zzR00"
 ADMIN_ID = 8032626504
 ADMIN_USERNAME = "ciwige"
 DB_NAME = "shop.db"
