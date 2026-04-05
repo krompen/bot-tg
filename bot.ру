@@ -534,14 +534,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting_remove_item"] = True
     
     elif data == "admin_status":
-        if user_id != ADMIN_ID:
-            return
-        global ADMIN_STATUS
-        if ADMIN_STATUS == "🟢 Онлайн":
-            ADMIN_STATUS = "🔴 Офлайн"
-        else:
-            ADMIN_STATUS = "🟢 Онлайн"
-        await query.edit_message_text(f"✅ Статус админа изменён на {ADMIN_STATUS}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+    if user_id != ADMIN_ID:
+        return
+    global ADMIN_STATUS
+    if ADMIN_STATUS == "🟢 Онлайн":
+        ADMIN_STATUS = "🔴 Офлайн"
+    else:
+        ADMIN_STATUS = "🟢 Онлайн"
+    await query.edit_message_text(f"✅ Статус админа изменён на {ADMIN_STATUS}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
     
     elif data.startswith("delete_test_"):
         deal_id = int(data.split("_")[2])
