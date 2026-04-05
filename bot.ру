@@ -1,0 +1,1223 @@
+import sqlite3
+import datetime
+import random
+import json
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+
+# ========== КОНФИГ ==========
+TOKEN = "8769635842:AAFVXgtl4g1pkv46jY4jVHEobwjWpWyaGYY"
+ADMIN_ID = 8032626504
+ADMIN_USERNAME = "ciwige"
+DB_NAME = "shop.db"
+
+ADMIN_STATUS = "🟢 Онлайн"
+
+# Настройки реф-системы
+REF_PERCENT = 10  # 10% от покупки реферала
+MIN_WITHDRAW = 500  # Минимальный вывод в звездах
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    
+    # Пользователи
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        registered_at TEXT,
+        balance INTEGER DEFAULT 0,
+        is_admin INTEGER DEFAULT 0,
+        is_banned INTEGER DEFAULT 0,
+        referrer_id INTEGER DEFAULT NULL,
+        ref_earned INTEGER DEFAULT 0
+    )''')
+    
+    # Теги/товары
+    c.execute('''CREATE TABLE IF NOT EXISTS tags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        category TEXT,
+        price INTEGER,
+        currency TEXT,
+        owner_id INTEGER,
+        history TEXT,
+        proof TEXT,
+        status TEXT DEFAULT 'active',
+        created_at TEXT
+    )''')
+    
+    # Заявки на добавление тегов
+    c.execute('''CREATE TABLE IF NOT EXISTS tag_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        tag_name TEXT,
+        category TEXT,
+        price INTEGER,
+        currency TEXT,
+        history TEXT,
+        proof TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        processed_at TEXT
+    )''')
+    
+    # Заказы
+    c.execute('''CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tag_id INTEGER,
+        buyer_id INTEGER,
+        seller_id INTEGER,
+        amount INTEGER,
+        currency TEXT,
+        status TEXT DEFAULT 'pending',
+        payment_proof TEXT,
+        created_at TEXT,
+        completed_at TEXT
+    )''')
+    
+    # Тикеты поддержки
+    c.execute('''CREATE TABLE IF NOT EXISTS tickets (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        username TEXT,
+        question TEXT,
+        status TEXT DEFAULT 'open',
+        taken_by INTEGER DEFAULT NULL,
+        created_at TEXT,
+        taken_at TEXT,
+        answer TEXT,
+        answered_at TEXT
+    )''')
+    
+    # Отзывы
+    c.execute('''CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reviewer_id INTEGER,
+        seller_id INTEGER,
+        tag_id INTEGER,
+        rating INTEGER,
+        comment TEXT,
+        created_at TEXT
+    )''')
+    
+    # Транзакции выводов
+    c.execute('''CREATE TABLE IF NOT EXISTS withdrawals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount INTEGER,
+        wallet TEXT,
+        status TEXT DEFAULT 'pending',
+        created_at TEXT,
+        processed_at TEXT
+    )''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def add_user(user_id, username, full_name, referrer_id=None):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Проверяем, есть ли уже пользователь
+    c.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+    if c.fetchone():
+        conn.close()
+        return False
+    
+    c.execute('INSERT INTO users (user_id, username, full_name, registered_at, referrer_id) VALUES (?, ?, ?, ?, ?)',
+              (user_id, username, full_name, now, referrer_id))
+    conn.commit()
+    conn.close()
+    
+    # Начисляем бонус рефереру
+    if referrer_id:
+        update_balance(referrer_id, 50)  # Бонус 50 звезд за приглашение
+        add_transaction(referrer_id, 50, "referral_bonus", f"Бонус за приглашение @{username}")
+    
+    return True
+
+def get_user(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT user_id, username, full_name, registered_at, balance, is_admin, is_banned, referrer_id, ref_earned FROM users WHERE user_id = ?', (user_id,))
+    user = c.fetchone()
+    conn.close()
+    return user
+
+def update_balance(user_id, amount):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, user_id))
+    conn.commit()
+    conn.close()
+
+def add_transaction(user_id, amount, type, description):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO transactions (user_id, amount, type, description, created_at) VALUES (?, ?, ?, ?, ?)',
+              (user_id, amount, type, description, now))
+    conn.commit()
+    conn.close()
+
+def get_all_tags(category=None):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    if category:
+        c.execute('SELECT id, name, category, price, currency, owner_id, history, proof FROM tags WHERE status = "active" AND category = ?', (category,))
+    else:
+        c.execute('SELECT id, name, category, price, currency, owner_id, history, proof FROM tags WHERE status = "active"')
+    tags = c.fetchall()
+    conn.close()
+    return tags
+
+def add_tag(name, category, price, currency, owner_id, history, proof):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO tags (name, category, price, currency, owner_id, history, proof, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              (name, category, price, currency, owner_id, history, proof, now))
+    tag_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return tag_id
+
+def create_tag_request(user_id, tag_name, category, price, currency, history, proof):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO tag_requests (user_id, tag_name, category, price, currency, history, proof, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+              (user_id, tag_name, category, price, currency, history, proof, now))
+    request_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return request_id
+
+def get_pending_requests():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT id, user_id, tag_name, category, price, currency, history, proof, created_at FROM tag_requests WHERE status = "pending" ORDER BY id DESC')
+    requests = c.fetchall()
+    conn.close()
+    return requests
+
+def approve_request(request_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('SELECT user_id, tag_name, category, price, currency, history, proof FROM tag_requests WHERE id = ?', (request_id,))
+    req = c.fetchone()
+    if req:
+        add_tag(req[1], req[2], req[3], req[4], req[0], req[5], req[6])
+        c.execute('UPDATE tag_requests SET status = "approved", processed_at = ? WHERE id = ?', (now, request_id))
+    conn.commit()
+    conn.close()
+
+def reject_request(request_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE tag_requests SET status = "rejected", processed_at = ? WHERE id = ?', (now, request_id))
+    conn.commit()
+    conn.close()
+
+def create_ticket(user_id, username, question):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO tickets (user_id, username, question, status, created_at) VALUES (?, ?, ?, ?, ?)',
+              (user_id, username, question, 'open', now))
+    ticket_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return ticket_id
+
+def get_open_tickets():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT id, user_id, username, question, created_at FROM tickets WHERE status = "open" ORDER BY id DESC')
+    tickets = c.fetchall()
+    conn.close()
+    return tickets
+
+def take_ticket(ticket_id, admin_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE tickets SET status = "taken", taken_by = ?, taken_at = ? WHERE id = ?', (admin_id, now, ticket_id))
+    conn.commit()
+    conn.close()
+
+def close_ticket(ticket_id, answer):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE tickets SET status = "closed", answer = ?, answered_at = ? WHERE id = ?', (answer, now, ticket_id))
+    conn.commit()
+    conn.close()
+
+def create_order(tag_id, buyer_id, seller_id, amount, currency):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO orders (tag_id, buyer_id, seller_id, amount, currency, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+              (tag_id, buyer_id, seller_id, amount, currency, now))
+    order_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return order_id
+
+def add_review(reviewer_id, seller_id, tag_id, rating, comment):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO reviews (reviewer_id, seller_id, tag_id, rating, comment, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+              (reviewer_id, seller_id, tag_id, rating, comment, now))
+    conn.commit()
+    conn.close()
+
+def get_seller_reviews(seller_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT reviewer_id, rating, comment, created_at FROM reviews WHERE seller_id = ? ORDER BY id DESC LIMIT 10', (seller_id,))
+    reviews = c.fetchall()
+    conn.close()
+    return reviews
+
+def get_user_orders(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT id, tag_id, amount, currency, status, created_at FROM orders WHERE buyer_id = ? ORDER BY id DESC', (user_id,))
+    orders = c.fetchall()
+    conn.close()
+    return orders
+
+def get_all_users():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    users = c.execute('SELECT user_id FROM users WHERE is_banned = 0').fetchall()
+    conn.close()
+    return users
+
+def ban_user(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_banned = 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def unban_user(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_banned = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def make_admin(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_admin = 1 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def remove_admin(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET is_admin = 0 WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+def create_withdrawal(user_id, amount, wallet):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO withdrawals (user_id, amount, wallet, created_at) VALUES (?, ?, ?, ?)',
+              (user_id, amount, wallet, now))
+    withdrawal_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return withdrawal_id
+
+def get_pending_withdrawals():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT id, user_id, amount, wallet, created_at FROM withdrawals WHERE status = "pending" ORDER BY id DESC')
+    withdrawals = c.fetchall()
+    conn.close()
+    return withdrawals
+
+def approve_withdrawal(withdrawal_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('SELECT user_id, amount FROM withdrawals WHERE id = ?', (withdrawal_id,))
+    wd = c.fetchone()
+    if wd:
+        update_balance(wd[0], -wd[1])
+        c.execute('UPDATE withdrawals SET status = "approved", processed_at = ? WHERE id = ?', (now, withdrawal_id))
+    conn.commit()
+    conn.close()
+
+def reject_withdrawal(withdrawal_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('UPDATE withdrawals SET status = "rejected", processed_at = ? WHERE id = ?', (now, withdrawal_id))
+    conn.commit()
+    conn.close()
+
+# ========== КЛАВИАТУРЫ ==========
+def main_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🛒 Магазин тегов", callback_data="shop")],
+        [InlineKeyboardButton("📝 Мои покупки", callback_data="my_orders")],
+        [InlineKeyboardButton("💰 Мой баланс", callback_data="my_balance")],
+        [InlineKeyboardButton("📤 Продать тег", callback_data="sell_tag")],
+        [InlineKeyboardButton("🔗 Реферальная система", callback_data="referral")],
+        [InlineKeyboardButton("⭐ Отзывы", callback_data="reviews_menu")],
+        [InlineKeyboardButton("💬 Поддержка", callback_data="support")],
+        [InlineKeyboardButton("ℹ️ Инфо", callback_data="info")]
+    ]
+    if ADMIN_ID:
+        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data="admin")])
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("🛒 Управление товарами", callback_data="admin_tags")],
+        [InlineKeyboardButton("📝 Заявки на теги", callback_data="admin_requests")],
+        [InlineKeyboardButton("🎭 Фейк-продажа", callback_data="admin_fake_sale")],
+        [InlineKeyboardButton("👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton("🆘 Тикеты", callback_data="admin_tickets")],
+        [InlineKeyboardButton("💰 Выводы средств", callback_data="admin_withdrawals")],
+        [InlineKeyboardButton("📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("🟢 Статус админа", callback_data="admin_status")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def admin_users_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("👑 Выдать админа", callback_data="admin_make_admin")],
+        [InlineKeyboardButton("🚫 Забанить", callback_data="admin_ban")],
+        [InlineKeyboardButton("✅ Разбанить", callback_data="admin_unban")],
+        [InlineKeyboardButton("📋 Список админов", callback_data="admin_list_admins")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="admin")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def categories_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("🔤 5-6 букв", callback_data="cat_5_6")],
+        [InlineKeyboardButton("⭐ Премиум", callback_data="cat_premium")],
+        [InlineKeyboardButton("🎮 Геймерские", callback_data="cat_gamer")],
+        [InlineKeyboardButton("💼 Бизнес", callback_data="cat_business")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="back")]])
+
+# ========== КОМАНДЫ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    
+    # Обработка реферальной ссылки
+    referrer_id = None
+    if context.args and context.args[0].startswith("ref_"):
+        try:
+            referrer_id = int(context.args[0].split("_")[1])
+            if referrer_id == user.id:
+                referrer_id = None
+        except:
+            pass
+    
+    add_user(user.id, user.username, user.full_name, referrer_id)
+    
+    await update.message.reply_text(
+        f"👋 Добро пожаловать в **TagShop**, {user.first_name}!\n\n"
+        f"🏷️ Здесь можно купить и продать красивые теги для Telegram.\n\n"
+        f"📌 **Как пользоваться:**\n"
+        f"• Нажми «🛒 Магазин тегов» — выбери категорию и купи тег\n"
+        f"• Нажми «📤 Продать тег» — отправь заявку на продажу\n"
+        f"• Нажми «🔗 Реферальная система» — получай 10% с покупок друзей\n\n"
+        f"👑 Админ: @{ADMIN_USERNAME} {ADMIN_STATUS}\n\n"
+        f"⬇️ Начинай прямо сейчас!",
+        reply_markup=main_keyboard(),
+        parse_mode="Markdown"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    user_id = query.from_user.id
+    
+    # Проверка бана
+    user = get_user(user_id)
+    if user and user[6] == 1 and data not in ["admin", "support"]:
+        await query.edit_message_text("🚫 Вы забанены. Обратитесь к админу @{ADMIN_USERNAME}", reply_markup=back_keyboard())
+        return
+    
+    # Главное меню
+    if data == "back":
+        await query.edit_message_text("Главное меню:", reply_markup=main_keyboard())
+        return
+    
+    elif data == "shop":
+        await query.edit_message_text("🛒 **Выбери категорию:**", reply_markup=categories_keyboard(), parse_mode="Markdown")
+    
+    elif data.startswith("cat_"):
+        category = data.replace("cat_", "")
+        tags = get_all_tags(category)
+        if not tags:
+            await query.edit_message_text("📭 В этой категории пока нет тегов.", reply_markup=back_keyboard())
+            return
+        
+        text = f"🛒 **Теги в категории {category}:**\n\n"
+        for tag in tags[:10]:
+            text += f"🏷️ `{tag[1]}` | 💰 {tag[3]} {tag[4]}\n"
+        text += "\nНажми на тег, чтобы купить:"
+        
+        keyboard = []
+        for tag in tags[:10]:
+            keyboard.append([InlineKeyboardButton(f"🏷️ {tag[1]} - {tag[3]} {tag[4]}", callback_data=f"buy_{tag[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="shop")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("buy_"):
+        tag_id = int(data.split("_")[1])
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT id, name, price, currency, owner_id, history, proof FROM tags WHERE id = ? AND status = "active"', (tag_id,))
+        tag = c.fetchone()
+        conn.close()
+        
+        if not tag:
+            await query.edit_message_text("❌ Тег уже продан или удалён.", reply_markup=back_keyboard())
+            return
+        
+        context.user_data["buy_tag_id"] = tag_id
+        context.user_data["buy_price"] = tag[2]
+        context.user_data["buy_currency"] = tag[3]
+        
+        text = f"🏷️ **{tag[1]}**\n\n"
+        text += f"💰 Цена: {tag[2]} {tag[3]}\n"
+        text += f"📖 История: {tag[5] or 'Не указана'}\n"
+        text += f"📸 Доказательства: {tag[6] or 'Нет'}\n\n"
+        text += f"Для оплаты отправь {tag[2]} {tag[3]} на кошелёк @{ADMIN_USERNAME}\n"
+        text += f"После оплаты отправь сюда чек командой /pay {tag_id}\n\n"
+        text += f"✅ Проверка продавца: {'⭐' * 5}"
+        
+        await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
+    
+    elif data == "my_orders":
+        orders = get_user_orders(user_id)
+        if not orders:
+            await query.edit_message_text("📭 У вас пока нет покупок.", reply_markup=back_keyboard())
+            return
+        
+        text = "📝 **Ваши покупки:**\n\n"
+        for order in orders[:10]:
+            status_emoji = {"pending": "⏳", "completed": "✅", "cancelled": "❌"}.get(order[4], "❓")
+            text += f"{status_emoji} Заказ #{order[0]} | {order[2]} {order[3]}\n📅 {order[5]}\n\n"
+        
+        await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
+    
+    elif data == "my_balance":
+        user_data = get_user(user_id)
+        if not user_data:
+            await query.edit_message_text("❌ Ошибка.", reply_markup=back_keyboard())
+            return
+        
+        text = f"💰 **Ваш баланс:** {user_data[4]} ⭐\n\n"
+        text += f"👥 Реферальный баланс: {user_data[8]} ⭐\n"
+        text += f"🔗 Ваша реф-ссылка: `https://t.me/{context.bot.username}?start=ref_{user_id}`\n\n"
+        text += f"💸 Минимальный вывод: {MIN_WITHDRAW} ⭐"
+        
+        keyboard = [[InlineKeyboardButton("💸 Вывести средства", callback_data="withdraw")]]
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data == "withdraw":
+        user_data = get_user(user_id)
+        if user_data[4] < MIN_WITHDRAW:
+            await query.edit_message_text(f"❌ Минимальный вывод: {MIN_WITHDRAW} ⭐\nВаш баланс: {user_data[4]} ⭐", reply_markup=back_keyboard())
+            return
+        
+        await query.edit_message_text("💸 **Вывод средств**\n\nВведи сумму и кошелёк в формате:\n`100 @username`", reply_markup=back_keyboard())
+        context.user_data["awaiting_withdraw"] = True
+    
+    elif data == "sell_tag":
+        await query.edit_message_text(
+            "📤 **Продажа тега**\n\n"
+            "Введи данные в формате:\n"
+            "`название | категория | цена | валюта | история | доказательства`\n\n"
+            "Пример: `test | 5-6 букв | 100 | stars | владел 2 года | @username`",
+            reply_markup=back_keyboard()
+        )
+        context.user_data["awaiting_sell_tag"] = True
+    
+    elif data == "referral":
+        user_data = get_user(user_id)
+        text = f"🔗 **Реферальная система**\n\n"
+        text += f"Ваша реф-ссылка:\n`https://t.me/{context.bot.username}?start=ref_{user_id}`\n\n"
+        text += f"💰 Заработано с рефералов: {user_data[8]} ⭐\n"
+        text += f"📊 Процент с покупок: {REF_PERCENT}%\n\n"
+        text += f"Приглашай друзей и получай бонусы!"
+        
+        await query.edit_message_text(text, reply_markup=back_keyboard(), parse_mode="Markdown")
+    
+    elif data == "reviews_menu":
+        keyboard = [
+            [InlineKeyboardButton("⭐ Оставить отзыв", callback_data="leave_review")],
+            [InlineKeyboardButton("📋 Мои отзывы", callback_data="my_reviews")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+        ]
+        await query.edit_message_text("⭐ **Меню отзывов**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data == "leave_review":
+        await query.edit_message_text("Введи ID продавца и отзыв в формате:\n`123456789 Оценка 5, отличный продавец!`", reply_markup=back_keyboard())
+        context.user_data["awaiting_review"] = True
+    
+    elif data == "my_reviews":
+        reviews = get_seller_reviews(user_id)
+        if not reviews:
+            await query.edit_message_text("📭 У вас пока нет отзывов.", reply_markup=back_keyboard())
+            return
+        
+        text = "⭐ **Ваши отзывы:**\n\n"
+        for rev in reviews[:10]:
+            text += f"👤 от пользователя: {rev[0]}\n⭐ {rev[1]}/5\n💬 {rev[2][:100]}\n📅 {rev[3]}\n\n"
+        
+        await query.edit_message_text(text[:4000], reply_markup=back_keyboard(), parse_mode="Markdown")
+    
+    elif data == "support":
+        await query.edit_message_text(
+            f"🆘 **Поддержка**\n\n"
+            f"👑 Админ: @{ADMIN_USERNAME} {ADMIN_STATUS}\n\n"
+            f"✏️ Напиши сюда сообщение, я передам админу.\n\n"
+            f"Админ ответит в ближайшее время.",
+            reply_markup=back_keyboard()
+        )
+        context.user_data["awaiting_ticket"] = True
+    
+    elif data == "info":
+        await query.edit_message_text(
+            f"ℹ️ **О боте**\n\n"
+            f"🤖 **TagShop Bot**\n\n"
+            f"🏷️ Здесь можно купить и продать красивые теги для Telegram.\n\n"
+            f"💎 Поддерживаются валюты:\n"
+            f"• ⭐ Telegram Stars\n"
+            f"• 💎 TON, USDT\n"
+            f"• 💵 Доллары (@send)\n\n"
+            f"👑 Админ: @{ADMIN_USERNAME}\n"
+            f"📊 Реферальная система: {REF_PERCENT}%",
+            reply_markup=back_keyboard()
+        )
+    
+    # ========== АДМИН-ПАНЕЛЬ ==========
+    elif data == "admin":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            await query.edit_message_text("⛔ Нет доступа.", reply_markup=back_keyboard())
+            return
+        await query.edit_message_text("👑 **Админ-панель**", reply_markup=admin_keyboard(), parse_mode="Markdown")
+    
+    elif data == "admin_stats":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        total_users = c.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        total_tags = c.execute('SELECT COUNT(*) FROM tags WHERE status = "active"').fetchone()[0]
+        total_orders = c.execute('SELECT COUNT(*) FROM orders WHERE status = "completed"').fetchone()[0]
+        total_revenue = c.execute('SELECT SUM(amount) FROM orders WHERE status = "completed"').fetchone()[0] or 0
+        pending_requests = c.execute('SELECT COUNT(*) FROM tag_requests WHERE status = "pending"').fetchone()[0]
+        open_tickets = c.execute('SELECT COUNT(*) FROM tickets WHERE status = "open"').fetchone()[0]
+        conn.close()
+        
+        await query.edit_message_text(
+            f"📊 **Статистика**\n\n"
+            f"👥 Пользователей: {total_users}\n"
+            f"🏷️ Активных тегов: {total_tags}\n"
+            f"📦 Завершённых заказов: {total_orders}\n"
+            f"💰 Общий доход: {total_revenue} ⭐\n"
+            f"📝 Заявок на теги: {pending_requests}\n"
+            f"🆘 Открытых тикетов: {open_tickets}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "admin_tags":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить тег", callback_data="admin_add_tag")],
+            [InlineKeyboardButton("🗑️ Удалить тег", callback_data="admin_remove_tag")],
+            [InlineKeyboardButton("📋 Список тегов", callback_data="admin_list_tags")],
+            [InlineKeyboardButton("🔙 Назад", callback_data="admin")]
+        ]
+        await query.edit_message_text("🛒 **Управление товарами**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data == "admin_add_tag":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        await query.edit_message_text("➕ **Добавление тега**\n\nВведи данные в формате:\n`название | категория | цена | валюта | история | доказательства`", reply_markup=back_keyboard())
+        context.user_data["awaiting_admin_add_tag"] = True
+    
+    elif data == "admin_remove_tag":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        tags = get_all_tags()
+        if not tags:
+            await query.edit_message_text("📭 Нет тегов для удаления.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_tags")]]))
+            return
+        
+        keyboard = []
+        for tag in tags[:20]:
+            keyboard.append([InlineKeyboardButton(f"🗑️ {tag[1]} - {tag[3]} {tag[4]}", callback_data=f"admin_del_tag_{tag[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin_tags")])
+        
+        await query.edit_message_text("🗑️ **Выбери тег для удаления:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("admin_del_tag_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        tag_id = int(data.split("_")[3])
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('UPDATE tags SET status = "deleted" WHERE id = ?', (tag_id,))
+        conn.commit()
+        conn.close()
+        await query.edit_message_text(f"✅ Тег #{tag_id} удалён.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_tags")]]))
+    
+    elif data == "admin_list_tags":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        tags = get_all_tags()
+        if not tags:
+            await query.edit_message_text("📭 Нет активных тегов.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_tags")]]))
+            return
+        
+        text = "📋 **Активные теги:**\n\n"
+        for tag in tags[:30]:
+            text += f"ID: {tag[0]} | {tag[1]} | {tag[3]} {tag[4]} | Категория: {tag[2]}\n"
+        
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_tags")]]), parse_mode="Markdown")
+    
+    elif data == "admin_requests":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        requests = get_pending_requests()
+        if not requests:
+            await query.edit_message_text("📭 Нет заявок на добавление тегов.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+            return
+        
+        text = "📝 **Заявки на теги:**\n\n"
+        for req in requests[:10]:
+            text += f"#{req[0]} | от @{req[2] or req[1]}\n📝 Тег: {req[3]}\n💰 {req[5]} {req[6]}\n💬 {req[7][:50]}\n\n"
+        
+        keyboard = []
+        for req in requests[:10]:
+            keyboard.append([InlineKeyboardButton(f"✅ Принять #{req[0]}", callback_data=f"approve_req_{req[0]}")])
+            keyboard.append([InlineKeyboardButton(f"❌ Отклонить #{req[0]}", callback_data=f"reject_req_{req[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin")])
+        
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("approve_req_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        req_id = int(data.split("_")[2])
+        approve_request(req_id)
+        await query.edit_message_text(f"✅ Заявка #{req_id} одобрена. Тег добавлен в магазин.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_requests")]]))
+    
+    elif data.startswith("reject_req_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        req_id = int(data.split("_")[2])
+        reject_request(req_id)
+        await query.edit_message_text(f"❌ Заявка #{req_id} отклонена.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_requests")]]))
+    
+    elif data == "admin_fake_sale":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        await query.edit_message_text(
+            "🎭 **Фейк-продажа**\n\n"
+            "Введи ID тега и сумму в формате:\n`tag_id сумма`\n\n"
+            "Пример: `15 100`\n\n"
+            "Это создаст тестовую продажу без реальной оплаты.",
+            reply_markup=back_keyboard()
+        )
+        context.user_data["awaiting_fake_sale"] = True
+    
+    elif data == "admin_users":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        await query.edit_message_text("👥 **Управление пользователями**", reply_markup=admin_users_keyboard(), parse_mode="Markdown")
+    
+    elif data == "admin_make_admin":
+        if user_id != ADMIN_ID:
+            return
+        await query.edit_message_text("👑 **Выдача прав админа**\n\nВведи ID пользователя:", reply_markup=back_keyboard())
+        context.user_data["awaiting_make_admin"] = True
+    
+    elif data == "admin_ban":
+        if user_id != ADMIN_ID:
+            return
+        await query.edit_message_text("🚫 **Бан пользователя**\n\nВведи ID пользователя:", reply_markup=back_keyboard())
+        context.user_data["awaiting_ban"] = True
+    
+    elif data == "admin_unban":
+        if user_id != ADMIN_ID:
+            return
+        await query.edit_message_text("✅ **Разбан пользователя**\n\nВведи ID пользователя:", reply_markup=back_keyboard())
+        context.user_data["awaiting_unban"] = True
+    
+    elif data == "admin_list_admins":
+        if user_id != ADMIN_ID:
+            return
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        admins = c.execute('SELECT user_id, username FROM users WHERE is_admin = 1').fetchall()
+        conn.close()
+        
+        if not admins:
+            await query.edit_message_text("📭 Нет администраторов.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]]))
+            return
+        
+        text = "👑 **Список администраторов:**\n\n"
+        for admin in admins:
+            text += f"ID: {admin[0]} | @{admin[1] or 'нет юзернейма'}\n"
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_users")]]), parse_mode="Markdown")
+    
+    elif data == "admin_tickets":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        tickets = get_open_tickets()
+        if not tickets:
+            await query.edit_message_text("📭 Нет открытых тикетов.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+            return
+        
+        text = "🆘 **Открытые тикеты:**\n\n"
+        for t in tickets[:10]:
+            text += f"#{t[0]} | @{t[2]} (ID: {t[1]})\n📝 {t[3][:50]}\n📅 {t[4]}\n\n"
+        
+        keyboard = []
+        for t in tickets[:10]:
+            keyboard.append([InlineKeyboardButton(f"✅ Взять в работу #{t[0]}", callback_data=f"take_ticket_{t[0]}")])
+            keyboard.append([InlineKeyboardButton(f"❌ Закрыть #{t[0]}", callback_data=f"close_ticket_{t[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin")])
+        
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("take_ticket_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        ticket_id = int(data.split("_")[2])
+        take_ticket(ticket_id, user_id)
+        
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM tickets WHERE id = ?', (ticket_id,))
+        ticket_user = c.fetchone()
+        conn.close()
+        
+        if ticket_user:
+            await context.bot.send_message(chat_id=ticket_user[0], text=f"🟢 Админ @{ADMIN_USERNAME} взял ваш тикет #{ticket_id} в работу!")
+        
+        await query.edit_message_text(f"✅ Тикет #{ticket_id} взят в работу.\n\nТеперь отправь ответ командой:\n`/answer_ticket {ticket_id} <ответ>`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_tickets")]]), parse_mode="Markdown")
+    
+    elif data.startswith("close_ticket_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        ticket_id = int(data.split("_")[2])
+        await query.edit_message_text(f"📝 Введи ответ для тикета #{ticket_id}:", reply_markup=back_keyboard())
+        context.user_data["awaiting_close_ticket"] = ticket_id
+    
+    elif data == "admin_withdrawals":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        withdrawals = get_pending_withdrawals()
+        if not withdrawals:
+            await query.edit_message_text("📭 Нет заявок на вывод.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+            return
+        
+        text = "💰 **Заявки на вывод:**\n\n"
+        for wd in withdrawals[:10]:
+            text += f"#{wd[0]} | от @{wd[2] or wd[1]} | {wd[2]} ⭐ | кошелёк: {wd[3]}\n📅 {wd[4]}\n\n"
+        
+        keyboard = []
+        for wd in withdrawals[:10]:
+            keyboard.append([InlineKeyboardButton(f"✅ Подтвердить #{wd[0]}", callback_data=f"approve_wd_{wd[0]}")])
+            keyboard.append([InlineKeyboardButton(f"❌ Отклонить #{wd[0]}", callback_data=f"reject_wd_{wd[0]}")])
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="admin")])
+        
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("approve_wd_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        wd_id = int(data.split("_")[2])
+        approve_withdrawal(wd_id)
+        await query.edit_message_text(f"✅ Вывод #{wd_id} подтверждён.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_withdrawals")]]))
+    
+    elif data.startswith("reject_wd_"):
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        wd_id = int(data.split("_")[2])
+        reject_withdrawal(wd_id)
+        await query.edit_message_text(f"❌ Вывод #{wd_id} отклонён.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin_withdrawals")]]))
+    
+    elif data == "admin_broadcast":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        await query.edit_message_text("📢 **Рассылка**\n\nВведи текст для рассылки всем пользователям:", reply_markup=back_keyboard())
+        context.user_data["awaiting_broadcast"] = True
+    
+    elif data == "admin_status":
+        if user_id != ADMIN_ID and (not user or user[5] != 1):
+            return
+        if ADMIN_STATUS == "🟢 Онлайн":
+            ADMIN_STATUS = "🔴 Офлайн"
+        else:
+            ADMIN_STATUS = "🟢 Онлайн"
+        await query.edit_message_text(f"✅ Статус админа изменён на {ADMIN_STATUS}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="admin")]]))
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    username = update.effective_user.username or str(user_id)
+    
+    user = get_user(user_id)
+    if user and user[6] == 1:
+        await update.message.reply_text("🚫 Вы забанены. Обратитесь к админу.")
+        return
+    
+    # Рассылка
+    if context.user_data.get("awaiting_broadcast") and (user_id == ADMIN_ID or (user and user[5] == 1)):
+        users = get_all_users()
+        sent = 0
+        for u in users:
+            try:
+                await context.bot.send_message(chat_id=u[0], text=f"📢 **РАССЫЛКА ОТ АДМИНА**\n\n{text}", parse_mode="Markdown")
+                sent += 1
+            except:
+                pass
+        await update.message.reply_text(f"✅ Рассылка отправлена {sent} пользователям.")
+        context.user_data["awaiting_broadcast"] = False
+        return
+    
+    # Продажа тега
+    if context.user_data.get("awaiting_sell_tag"):
+        try:
+            parts = text.split("|")
+            if len(parts) < 6:
+                await update.message.reply_text("❌ Неверный формат. Используй: `название | категория | цена | валюта | история | доказательства`", reply_markup=back_keyboard())
+                return
+            
+            name = parts[0].strip()
+            category = parts[1].strip()
+            price = int(parts[2].strip())
+            currency = parts[3].strip()
+            history = parts[4].strip()
+            proof = parts[5].strip()
+            
+            request_id = create_tag_request(user_id, name, category, price, currency, history, proof)
+            await update.message.reply_text(f"✅ Заявка #{request_id} отправлена на модерацию!\n\nАдмин рассмотрит её в ближайшее время.", reply_markup=main_keyboard())
+            
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"📝 **Новая заявка на тег #{request_id}**\n👤 @{username}\n🏷️ {name}\n💰 {price} {currency}\n📖 {history}\n📸 {proof}"
+            )
+            
+            context.user_data["awaiting_sell_tag"] = False
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}\nИспользуй формат: `название | категория | цена | валюта | история | доказательства`")
+        return
+    
+    # Добавление тега админом
+    if context.user_data.get("awaiting_admin_add_tag") and (user_id == ADMIN_ID or (user and user[5] == 1)):
+        try:
+            parts = text.split("|")
+            if len(parts) < 6:
+                await update.message.reply_text("❌ Неверный формат. Используй: `название | категория | цена | валюта | история | доказательства`")
+                return
+            
+            name = parts[0].strip()
+            category = parts[1].strip()
+            price = int(parts[2].strip())
+            currency = parts[3].strip()
+            history = parts[4].strip()
+            proof = parts[5].strip()
+            
+            add_tag(name, category, price, currency, ADMIN_ID, history, proof)
+            await update.message.reply_text(f"✅ Тег «{name}» добавлен в магазин!", reply_markup=main_keyboard())
+            context.user_data["awaiting_admin_add_tag"] = False
+        except:
+            await update.message.reply_text("❌ Ошибка. Используй формат: `название | категория | цена | валюта | история | доказательства`")
+        return
+    
+    # Тикет поддержки
+    if context.user_data.get("awaiting_ticket"):
+        ticket_id = create_ticket(user_id, username, text)
+        await update.message.reply_text(f"✅ Сообщение отправлено! Номер тикета: #{ticket_id}\nАдмин ответит в ближайшее время.", reply_markup=main_keyboard())
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🆕 **Новый тикет #{ticket_id}**\n👤 @{username} (ID: {user_id})\n📝 {text}"
+        )
+        context.user_data["awaiting_ticket"] = False
+        return
+    
+    # Вывод средств
+    if context.user_data.get("awaiting_withdraw"):
+        try:
+            parts = text.split()
+            amount = int(parts[0])
+            wallet = parts[1]
+            
+            user_data = get_user(user_id)
+            if user_data[4] < amount:
+                await update.message.reply_text(f"❌ Недостаточно средств. Ваш баланс: {user_data[4]} ⭐", reply_markup=main_keyboard())
+                context.user_data["awaiting_withdraw"] = False
+                return
+            
+            if amount < MIN_WITHDRAW:
+                await update.message.reply_text(f"❌ Минимальная сумма вывода: {MIN_WITHDRAW} ⭐", reply_markup=main_keyboard())
+                context.user_data["awaiting_withdraw"] = False
+                return
+            
+            create_withdrawal(user_id, amount, wallet)
+            await update.message.reply_text(f"✅ Заявка на вывод {amount} ⭐ отправлена! Админ проверит и отправит средства на {wallet}", reply_markup=main_keyboard())
+            context.user_data["awaiting_withdraw"] = False
+        except:
+            await update.message.reply_text("❌ Неверный формат. Введи: `сумма кошелёк`\nПример: `100 @username`", reply_markup=main_keyboard())
+            context.user_data["awaiting_withdraw"] = False
+        return
+    
+    # Отзыв
+    if context.user_data.get("awaiting_review"):
+        try:
+            parts = text.split(" ", 1)
+            seller_id = int(parts[0])
+            comment = parts[1]
+            
+            # Парсим оценку из комментария
+            rating = 5
+            if "оценка" in comment.lower():
+                for i in range(1, 6):
+                    if str(i) in comment:
+                        rating = i
+                        break
+            
+            add_review(user_id, seller_id, 0, rating, comment)
+            await update.message.reply_text(f"✅ Отзыв оставлен! Оценка: {rating}/5", reply_markup=main_keyboard())
+            context.user_data["awaiting_review"] = False
+        except:
+            await update.message.reply_text("❌ Неверный формат. Введи: `ID_продавца Текст отзыва`", reply_markup=main_keyboard())
+            context.user_data["awaiting_review"] = False
+        return
+    
+    # Фейк-продажа
+    if context.user_data.get("awaiting_fake_sale") and (user_id == ADMIN_ID or (user and user[5] == 1)):
+        try:
+            parts = text.split()
+            tag_id = int(parts[0])
+            amount = int(parts[1])
+            
+            conn = sqlite3.connect(DB_NAME, timeout=10)
+            c = conn.cursor()
+            c.execute('SELECT name, owner_id FROM tags WHERE id = ?', (tag_id,))
+            tag = c.fetchone()
+            conn.close()
+            
+            if not tag:
+                await update.message.reply_text("❌ Тег не найден.", reply_markup=main_keyboard())
+                return
+            
+            order_id = create_order(tag_id, ADMIN_ID, tag[1], amount, "stars")
+            await update.message.reply_text(f"🎭 **Фейк-продажа создана!**\n\nЗаказ #{order_id}\nТег: {tag[0]}\nСумма: {amount} ⭐\n\nСтатус: ожидает оплаты", reply_markup=main_keyboard())
+            context.user_data["awaiting_fake_sale"] = False
+        except:
+            await update.message.reply_text("❌ Неверный формат. Введи: `ID_тега сумма`", reply_markup=main_keyboard())
+            context.user_data["awaiting_fake_sale"] = False
+        return
+    
+    # Назначение админа
+    if context.user_data.get("awaiting_make_admin") and user_id == ADMIN_ID:
+        try:
+            target_id = int(text)
+            make_admin(target_id)
+            await update.message.reply_text(f"✅ Пользователь {target_id} назначен администратором!", reply_markup=main_keyboard())
+            await context.bot.send_message(chat_id=target_id, text="👑 Вам выданы права администратора!")
+            context.user_data["awaiting_make_admin"] = False
+        except:
+            await update.message.reply_text("❌ Ошибка. Введи корректный ID пользователя.", reply_markup=main_keyboard())
+            context.user_data["awaiting_make_admin"] = False
+        return
+    
+    # Бан
+    if context.user_data.get("awaiting_ban") and user_id == ADMIN_ID:
+        try:
+            target_id = int(text)
+            ban_user(target_id)
+            await update.message.reply_text(f"✅ Пользователь {target_id} забанен!", reply_markup=main_keyboard())
+            await context.bot.send_message(chat_id=target_id, text="🚫 Вы были забанены в боте!")
+            context.user_data["awaiting_ban"] = False
+        except:
+            await update.message.reply_text("❌ Ошибка. Введи корректный ID пользователя.", reply_markup=main_keyboard())
+            context.user_data["awaiting_ban"] = False
+        return
+    
+    # Разбан
+    if context.user_data.get("awaiting_unban") and user_id == ADMIN_ID:
+        try:
+            target_id = int(text)
+            unban_user(target_id)
+            await update.message.reply_text(f"✅ Пользователь {target_id} разбанен!", reply_markup=main_keyboard())
+            await context.bot.send_message(chat_id=target_id, text="✅ Вы были разбанены в боте!")
+            context.user_data["awaiting_unban"] = False
+        except:
+            await update.message.reply_text("❌ Ошибка. Введи корректный ID пользователя.", reply_markup=main_keyboard())
+            context.user_data["awaiting_unban"] = False
+        return
+    
+    # Закрытие тикета с ответом
+    if context.user_data.get("awaiting_close_ticket"):
+        ticket_id = context.user_data["awaiting_close_ticket"]
+        close_ticket(ticket_id, text)
+        
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        c = conn.cursor()
+        c.execute('SELECT user_id FROM tickets WHERE id = ?', (ticket_id,))
+        ticket_user = c.fetchone()
+        conn.close()
+        
+        if ticket_user:
+            await context.bot.send_message(chat_id=ticket_user[0], text=f"📬 **Ответ на тикет #{ticket_id}**\n\n{text}")
+        
+        await update.message.reply_text(f"✅ Тикет #{ticket_id} закрыт с ответом.", reply_markup=main_keyboard())
+        context.user_data["awaiting_close_ticket"] = False
+        return
+    
+    # Команда оплаты
+    if text.startswith("/pay"):
+        try:
+            parts = text.split()
+            tag_id = int(parts[1])
+            
+            await update.message.reply_text(
+                f"💰 Оплата тега #{tag_id}\n\n"
+                f"Отправь чек оплаты на @{ADMIN_USERNAME}\n"
+                f"Или переведи звёзды через Telegram Stars\n\n"
+                f"После оплаты напиши /confirm {tag_id}",
+                reply_markup=main_keyboard()
+            )
+        except:
+            await update.message.reply_text("❌ Используй: /pay <id_тега>")
+        return
+    
+    # Подтверждение оплаты
+    if text.startswith("/confirm"):
+        try:
+            parts = text.split()
+            tag_id = int(parts[1])
+            
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"💰 **Запрос на подтверждение оплаты**\n👤 @{username}\n🏷️ Тег #{tag_id}\n\nПроверь оплату и подтверди командой:\n/complete {tag_id} {user_id}"
+            )
+            await update.message.reply_text("✅ Запрос отправлен админу. Ожидайте подтверждения.", reply_markup=main_keyboard())
+        except:
+            await update.message.reply_text("❌ Используй: /confirm <id_тега>")
+        return
+    
+    # Завершение продажи (админ)
+    if text.startswith("/complete") and (user_id == ADMIN_ID or (user and user[5] == 1)):
+        try:
+            parts = text.split()
+            tag_id = int(parts[1])
+            buyer_id = int(parts[2])
+            
+            conn = sqlite3.connect(DB_NAME, timeout=10)
+            c = conn.cursor()
+            c.execute('SELECT name, owner_id FROM tags WHERE id = ?', (tag_id,))
+            tag = c.fetchone()
+            
+            if tag:
+                # Обновляем владельца тега
+                c.execute('UPDATE tags SET owner_id = ?, status = "sold" WHERE id = ?', (buyer_id, tag_id))
+                # Завершаем заказ
+                c.execute('UPDATE orders SET status = "completed", completed_at = ? WHERE tag_id = ? AND buyer_id = ?', 
+                         (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tag_id, buyer_id))
+                conn.commit()
+                
+                # Начисляем реферальный бонус
+                buyer = get_user(buyer_id)
+                if buyer and buyer[7]:
+                    ref_bonus = int(tag[2] * REF_PERCENT / 100)
+                    update_balance(buyer[7], ref_bonus)
+                    add_transaction(buyer[7], ref_bonus, "ref_bonus", f"Бонус за покупку реферала")
+                
+                await update.message.reply_text(f"✅ Продажа тега {tag[0]} подтверждена!\nПокупатель: {buyer_id}")
+                await context.bot.send_message(chat_id=buyer_id, text=f"✅ Ваша покупка тега {tag[0]} подтверждена!\n\nТег ваш! Спасибо за покупку!")
+            
+            conn.close()
+        except:
+            await update.message.reply_text("❌ Используй: /complete <id_тега> <id_покупателя>")
+        return
+    
+    # Ответ на тикет через команду
+    if text.startswith("/answer_ticket") and (user_id == ADMIN_ID or (user and user[5] == 1)):
+        try:
+            parts = text.split(" ", 2)
+            ticket_id = int(parts[1])
+            answer = parts[2]
+            
+            close_ticket(ticket_id, answer)
+            
+            conn = sqlite3.connect(DB_NAME, timeout=10)
+            c = conn.cursor()
+            c.execute('SELECT user_id FROM tickets WHERE id = ?', (ticket_id,))
+            ticket_user = c.fetchone()
+            conn.close()
+            
+            if ticket_user:
+                await context.bot.send_message(chat_id=ticket_user[0], text=f"📬 **Ответ на тикет #{ticket_id}**\n\n{answer}")
+            
+            await update.message.reply_text(f"✅ Тикет #{ticket_id} закрыт с ответом.", reply_markup=main_keyboard())
+        except:
+            await update.message.reply_text("❌ Используй: /answer_ticket <id_тикета> <ответ>")
+        return
+    
+    # Если ничего не подошло
+    await update.message.reply_text("Используй кнопки меню для навигации.", reply_markup=main_keyboard())
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("pay", handle_text))
+    app.add_handler(CommandHandler("confirm", handle_text))
+    app.add_handler(CommandHandler("complete", handle_text))
+    app.add_handler(CommandHandler("answer_ticket", handle_text))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("🚀 TagShop Bot запущен!")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
