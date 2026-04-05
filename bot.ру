@@ -16,7 +16,9 @@ GEMINI_API_KEY = "AIzaSyDhmct06iD5KA2x49mtrhlOTr5Xpopb9gY"
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+
+# Правильная модель для v1beta
+model = genai.GenerativeModel('models/gemini-1.0-pro-latest')
 
 # VIP статусы
 VIP_PRICE = 500  # 500 stars или можно в рублях
