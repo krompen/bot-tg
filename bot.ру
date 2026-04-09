@@ -1,0 +1,541 @@
+import random
+import string
+import sqlite3
+import datetime
+import hashlib
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+
+# ========== КОНФИГ ==========
+TOKEN = "8656712072:AAFxbYDofb5MhU95DD0rfL_KqtM128CFdrU"
+ADMIN_ID = 8032626504
+DB_NAME = "passwords.db"
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        registered_at TEXT
+    )''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS passwords (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        password TEXT,
+        category TEXT,
+        service TEXT,
+        created_at TEXT
+    )''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def add_user(user_id, username):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT OR IGNORE INTO users (user_id, username, registered_at) VALUES (?, ?, ?)', (user_id, username, now))
+    conn.commit()
+    conn.close()
+
+def save_password(user_id, password, category, service):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO passwords (user_id, password, category, service, created_at) VALUES (?, ?, ?, ?, ?)',
+              (user_id, password, category, service, now))
+    conn.commit()
+    conn.close()
+
+def get_user_passwords(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    passwords = c.execute('SELECT id, password, category, service, created_at FROM passwords WHERE user_id = ? ORDER BY id DESC', (user_id,)).fetchall()
+    conn.close()
+    return passwords
+
+def delete_password(password_id, user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('DELETE FROM passwords WHERE id = ? AND user_id = ?', (password_id, user_id))
+    conn.commit()
+    conn.close()
+
+def get_all_passwords(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    passwords = c.execute('SELECT password FROM passwords WHERE user_id = ?', (user_id,)).fetchall()
+    conn.close()
+    return [p[0] for p in passwords]
+
+# ========== ГЕНЕРАЦИЯ ПАРОЛЕЙ (УНИКАЛЬНЫЕ) ==========
+def generate_password(length=12, use_upper=True, use_lower=True, use_digits=True, use_symbols=False):
+    chars = ""
+    if use_upper: chars += string.ascii_uppercase
+    if use_lower: chars += string.ascii_lowercase
+    if use_digits: chars += string.digits
+    if use_symbols: chars += "!@#$%^&*()_+-=[]{}|;:,.<>?"
+    
+    if not chars:
+        chars = string.ascii_letters + string.digits
+    
+    return ''.join(random.choice(chars) for _ in range(length))
+
+def generate_unique_password(user_id, length=12, use_upper=True, use_lower=True, use_digits=True, use_symbols=False):
+    """Генерирует уникальный пароль, которого нет в БД у пользователя"""
+    existing = get_all_passwords(user_id)
+    existing_set = set(existing)
+    
+    for _ in range(100):  # Максимум 100 попыток
+        password = generate_password(length, use_upper, use_lower, use_digits, use_symbols)
+        if password not in existing_set:
+            return password
+    return generate_password(length, use_upper, use_lower, use_digits, use_symbols)
+
+def check_password_strength(password):
+    """Оценка надёжности пароля"""
+    score = 0
+    feedback = []
+    
+    if len(password) >= 8:
+        score += 1
+    else:
+        feedback.append("❌ Слишком короткий (минимум 8 символов)")
+    
+    if len(password) >= 12:
+        score += 1
+    
+    if any(c.isupper() for c in password):
+        score += 1
+    else:
+        feedback.append("❌ Добавьте заглавные буквы")
+    
+    if any(c.islower() for c in password):
+        score += 1
+    else:
+        feedback.append("❌ Добавьте строчные буквы")
+    
+    if any(c.isdigit() for c in password):
+        score += 1
+    else:
+        feedback.append("❌ Добавьте цифры")
+    
+    if any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
+        score += 1
+    else:
+        feedback.append("⚠️ Добавьте спецсимволы для надёжности")
+    
+    if score <= 2:
+        strength = "🔴 КРИТИЧЕСКИ СЛАБЫЙ"
+        color = "🔴"
+    elif score <= 4:
+        strength = "🟡 СЛАБЫЙ"
+        color = "🟡"
+    elif score <= 6:
+        strength = "🟢 СРЕДНИЙ"
+        color = "🟢"
+    else:
+        strength = "✅ ОЧЕНЬ СИЛЬНЫЙ"
+        color = "✅"
+    
+    return strength, feedback, score
+
+def get_internet_advice(category):
+    """Советы по безопасности из интернета"""
+    tips = {
+        "vk": [
+            "🔐 Включите двухфакторную аутентификацию",
+            "📱 Не используйте пароль от ВК на других сайтах",
+            "🔄 Меняйте пароль раз в 3 месяца"
+        ],
+        "telegram": [
+            "🔐 Обязательно включите облачный пароль",
+            "📱 Настройте двухфакторную аутентификацию",
+            "🚫 Не используйте один пароль для Telegram и других сервисов"
+        ],
+        "email": [
+            "🔐 Используйте уникальный пароль для почты",
+            "📱 Включите двухфакторную аутентификацию",
+            "🔄 Регулярно проверяйте активные сессии"
+        ],
+        "bank": [
+            "🔐 Самый надёжный пароль должен быть у банка",
+            "📱 Не храните пароль от банка в заметках",
+            "⚠️ Не используйте один пароль для разных банков"
+        ],
+        "social": [
+            "🔐 Используйте разные пароли для разных соцсетей",
+            "📱 Включите двухфакторную аутентификацию везде",
+            "🚫 Не переходите по подозрительным ссылкам"
+        ],
+        "other": [
+            "🔐 Используйте менеджер паролей",
+            "📱 Не храните пароли в заметках телефона",
+            "🔄 Регулярно меняйте пароли от важных сервисов",
+            "⚠️ Не используйте личную информацию в паролях"
+        ]
+    }
+    return tips.get(category, tips["other"])
+
+def get_general_tips():
+    """Общие советы по безопасности"""
+    return [
+        "🔐 Используйте уникальные пароли для каждого сервиса",
+        "📱 Включите двухфакторную аутентификацию везде, где можно",
+        "🔄 Меняйте пароли каждые 3-6 месяцев",
+        "🚫 Никогда не сообщайте пароль третьим лицам",
+        "📝 Используйте менеджер паролей (Bitwarden, Keepass, 1Password)",
+        "⚠️ Не используйте личную информацию (даты рождения, имена)",
+        "🔒 Длина пароля должна быть не менее 12 символов",
+        "🎲 Используйте комбинацию букв, цифр и спецсимволов"
+    ]
+
+# ========== КЛАВИАТУРЫ ==========
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 СГЕНЕРИРОВАТЬ ПАРОЛЬ", callback_data="generate_menu")],
+        [InlineKeyboardButton("📋 МОИ ПАРОЛИ", callback_data="my_passwords"),
+         InlineKeyboardButton("🔍 ПРОВЕРИТЬ ПАРОЛЬ", callback_data="check_password")],
+        [InlineKeyboardButton("💡 СОВЕТЫ ПО БЕЗОПАСНОСТИ", callback_data="tips")],
+        [InlineKeyboardButton("ℹ️ ИНФО", callback_data="info")]
+    ])
+
+def category_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📱 ВКОНТАКТЕ (VK)", callback_data="cat_vk"),
+         InlineKeyboardButton("📱 TELEGRAM", callback_data="cat_telegram")],
+        [InlineKeyboardButton("📧 ПОЧТА (Gmail, Mail)", callback_data="cat_email"),
+         InlineKeyboardButton("💰 БАНКИ / КАРТЫ", callback_data="cat_bank")],
+        [InlineKeyboardButton("🌐 ДРУГИЕ СОЦСЕТИ", callback_data="cat_social"),
+         InlineKeyboardButton("🔧 ДРУГИЕ САЙТЫ", callback_data="cat_other")],
+        [InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]
+    ])
+
+def length_keyboard(category):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 8 СИМВОЛОВ", callback_data=f"len_8_{category}"),
+         InlineKeyboardButton("🔢 12 СИМВОЛОВ", callback_data=f"len_12_{category}")],
+        [InlineKeyboardButton("🔢 16 СИМВОЛОВ", callback_data=f"len_16_{category}"),
+         InlineKeyboardButton("🔢 20 СИМВОЛОВ", callback_data=f"len_20_{category}")],
+        [InlineKeyboardButton("🔢 24 СИМВОЛА", callback_data=f"len_24_{category}"),
+         InlineKeyboardButton("🔢 32 СИМВОЛА", callback_data=f"len_32_{category}")],
+        [InlineKeyboardButton("🔙 НАЗАД", callback_data="generate_menu")]
+    ])
+
+def options_keyboard(length, category):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ЗАГЛАВНЫЕ БУКВЫ (A-Z)", callback_data=f"opt_upper_{length}_{category}"),
+         InlineKeyboardButton("✅ СТРОЧНЫЕ (a-z)", callback_data=f"opt_lower_{length}_{category}")],
+        [InlineKeyboardButton("✅ ЦИФРЫ (0-9)", callback_data=f"opt_digits_{length}_{category}"),
+         InlineKeyboardButton("❌ СПЕЦСИМВОЛЫ", callback_data=f"opt_symbols_{length}_{category}")],
+        [InlineKeyboardButton("✅ СГЕНЕРИРОВАТЬ", callback_data=f"generate_{length}_{category}"),
+         InlineKeyboardButton("🔙 НАЗАД", callback_data=f"back_len_{category}")]
+    ])
+
+def passwords_keyboard(passwords):
+    keyboard = []
+    for p in passwords[:10]:
+        keyboard.append([InlineKeyboardButton(f"🗑️ УДАЛИТЬ #{p[0]}", callback_data=f"del_{p[0]}")])
+    keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="back")])
+    return InlineKeyboardMarkup(keyboard)
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]])
+
+# ========== ОБРАБОТЧИКИ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    add_user(user.id, user.username or str(user.id))
+    
+    await update.message.reply_text(
+        "╔════════════════════════════════════════════╗\n"
+        "║  🔐 ДОБРО ПОЖАЛОВАТЬ В PASSGEN! 🔐        ║\n"
+        "╠════════════════════════════════════════════╣\n"
+        "║  📱 ГЕНЕРАТОР НАДЁЖНЫХ ПАРОЛЕЙ             ║\n"
+        "║  🔒 ДЛЯ ЛЮБЫХ СЕРВИСОВ                     ║\n"
+        "║  💡 СОВЕТЫ ПО БЕЗОПАСНОСТИ                 ║\n"
+        "║  📋 СОХРАНЕНИЕ ИСТОРИИ ПАРОЛЕЙ             ║\n"
+        "╠════════════════════════════════════════════╣\n"
+        "║  ⚠️ ВАЖНО:                                 ║\n"
+        "║  • НИКОГДА НЕ СООБЩАЙТЕ ПАРОЛИ ДРУГИМ      ║\n"
+        "║  • ИСПОЛЬЗУЙТЕ УНИКАЛЬНЫЕ ПАРОЛИ           ║\n"
+        "║  • ВКЛЮЧИТЕ ДВУХФАКТОРНУЮ АУТЕНТИФИКАЦИЮ   ║\n"
+        "╚════════════════════════════════════════════╝\n\n"
+        "⬇️ **ВЫБИРАЙ ДЕЙСТВИЕ:**",
+        reply_markup=main_keyboard(),
+        parse_mode="Markdown"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    user_id = query.from_user.id
+    
+    # ========== ГЛАВНОЕ МЕНЮ ==========
+    if data == "back":
+        context.user_data.clear()
+        await query.edit_message_text(
+            "⬇️ **ВЫБИРАЙ ДЕЙСТВИЕ:**",
+            reply_markup=main_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "generate_menu":
+        await query.edit_message_text(
+            "🔐 **ВЫБЕРИ КАТЕГОРИЮ**\n\n"
+            "ДЛЯ КАКОГО СЕРВИСА НУЖЕН ПАРОЛЬ?",
+            reply_markup=category_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    elif data.startswith("cat_"):
+        category = data.replace("cat_", "")
+        context.user_data["category"] = category
+        
+        category_names = {
+            "vk": "ВКОНТАКТЕ (VK)",
+            "telegram": "TELEGRAM",
+            "email": "ПОЧТЫ",
+            "bank": "БАНКА / КАРТЫ",
+            "social": "СОЦСЕТЕЙ",
+            "other": "ДРУГИХ САЙТОВ"
+        }
+        cat_name = category_names.get(category, "САЙТА")
+        
+        await query.edit_message_text(
+            f"🔐 **ГЕНЕРАЦИЯ ПАРОЛЯ ДЛЯ {cat_name}**\n\n"
+            f"💡 **СОВЕТЫ ДЛЯ {cat_name}:**\n"
+            f"{chr(10).join(get_internet_advice(category))}\n\n"
+            f"📏 **ВЫБЕРИ ДЛИНУ ПАРОЛЯ:**\n"
+            f"⚠️ РЕКОМЕНДУЕМАЯ ДЛИНА: 12-16 СИМВОЛОВ",
+            reply_markup=length_keyboard(category),
+            parse_mode="Markdown"
+        )
+    
+    elif data.startswith("len_"):
+        parts = data.split("_")
+        length = int(parts[1])
+        category = parts[2]
+        context.user_data["length"] = length
+        context.user_data["category"] = category
+        
+        await query.edit_message_text(
+            f"🔐 **НАСТРОЙКИ ПАРОЛЯ**\n\n"
+            f"📏 ДЛИНА: {length} СИМВОЛОВ\n"
+            f"📂 КАТЕГОРИЯ: {category}\n\n"
+            f"⚙️ **ВЫБЕРИ ПАРАМЕТРЫ:**\n"
+            f"• ЗАГЛАВНЫЕ БУКВЫ (A-Z) - РЕКОМЕНДУЕТСЯ\n"
+            f"• СТРОЧНЫЕ БУКВЫ (a-z) - РЕКОМЕНДУЕТСЯ\n"
+            f"• ЦИФРЫ (0-9) - РЕКОМЕНДУЕТСЯ\n"
+            f"• СПЕЦСИМВОЛЫ (!@#$) - ДЛЯ ОСОБО ВАЖНЫХ",
+            reply_markup=options_keyboard(length, category),
+            parse_mode="Markdown"
+        )
+    
+    elif data.startswith("opt_"):
+        parts = data.split("_")
+        option = parts[1]
+        length = int(parts[2])
+        category = parts[3]
+        
+        # Инвертируем настройку
+        current = context.user_data.get(f"opt_{option}", True)
+        context.user_data[f"opt_{option}"] = not current
+        
+        await query.edit_message_text(
+            f"🔐 **НАСТРОЙКИ ПАРОЛЯ**\n\n"
+            f"📏 ДЛИНА: {length} СИМВОЛОВ\n"
+            f"📂 КАТЕГОРИЯ: {category}\n\n"
+            f"⚙️ **ТЕКУЩИЕ НАСТРОЙКИ:**\n"
+            f"• ЗАГЛАВНЫЕ: {'✅' if context.user_data.get('opt_upper', True) else '❌'}\n"
+            f"• СТРОЧНЫЕ: {'✅' if context.user_data.get('opt_lower', True) else '❌'}\n"
+            f"• ЦИФРЫ: {'✅' if context.user_data.get('opt_digits', True) else '❌'}\n"
+            f"• СПЕЦСИМВОЛЫ: {'✅' if context.user_data.get('opt_symbols', False) else '❌'}\n\n"
+            f"⬇️ **НАЖМИ «СГЕНЕРИРОВАТЬ»**",
+            reply_markup=options_keyboard(length, category),
+            parse_mode="Markdown"
+        )
+    
+    elif data.startswith("generate_"):
+        parts = data.split("_")
+        length = int(parts[1])
+        category = parts[2]
+        
+        use_upper = context.user_data.get("opt_upper", True)
+        use_lower = context.user_data.get("opt_lower", True)
+        use_digits = context.user_data.get("opt_digits", True)
+        use_symbols = context.user_data.get("opt_symbols", False)
+        
+        password = generate_unique_password(user_id, length, use_upper, use_lower, use_digits, use_symbols)
+        strength, feedback, score = check_password_strength(password)
+        
+        # Сохраняем пароль
+        service_name = {
+            "vk": "ВКонтакте", "telegram": "Telegram", "email": "Почта",
+            "bank": "Банк/Карты", "social": "Соцсети", "other": "Другой сервис"
+        }.get(category, "Другой сервис")
+        
+        save_password(user_id, password, category, service_name)
+        
+        # Формируем красивое сообщение
+        advice_text = "\n".join([f"   {a}" for a in get_internet_advice(category)])
+        
+        await query.edit_message_text(
+            f"╔════════════════════════════════════════════╗\n"
+            f"║  🔐 **ВАШ НОВЫЙ ПАРОЛЬ**                  ║\n"
+            f"╠════════════════════════════════════════════╣\n"
+            f"║  📱 СЕРВИС: {service_name}                 ║\n"
+            f"║  🔑 ПАРОЛЬ: `{password}`                  ║\n"
+            f"╠════════════════════════════════════════════╣\n"
+            f"║  ⭐ НАДЁЖНОСТЬ: {strength}                 ║\n"
+            f"╚════════════════════════════════════════════╝\n\n"
+            f"💡 **СОВЕТЫ ДЛЯ {service_name.upper()}:**\n{advice_text}\n\n"
+            f"⚠️ **ВАЖНО:**\n"
+            f"• НИКОГДА НЕ СООБЩАЙТЕ ЭТОТ ПАРОЛЬ НИКОМУ\n"
+            f"• ПАРОЛЬ СОХРАНЁН В ИСТОРИЮ\n"
+            f"• НАЖМИТЕ «МОИ ПАРОЛИ» ЧТОБЫ ПОСМОТРЕТЬ\n\n"
+            f"⬇️ **ЧТО ДАЛЬШЕ?**",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 ЕЩЁ ПАРОЛЬ", callback_data=f"len_{length}_{category}"),
+                 InlineKeyboardButton("📋 МОИ ПАРОЛИ", callback_data="my_passwords")],
+                [InlineKeyboardButton("🔙 ГЛАВНОЕ МЕНЮ", callback_data="back")]
+            ]),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "my_passwords":
+        passwords = get_user_passwords(user_id)
+        if not passwords:
+            await query.edit_message_text(
+                "📭 **У ВАС ПОКА НЕТ СОХРАНЁННЫХ ПАРОЛЕЙ**\n\n"
+                "🔐 НАЖМИТЕ «СГЕНЕРИРОВАТЬ ПАРОЛЬ» ЧТОБЫ СОЗДАТЬ ПЕРВЫЙ!",
+                reply_markup=back_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        
+        text = "📋 **МОИ ПАРОЛИ:**\n\n"
+        for p in passwords[:15]:
+            text += f"┌─────────────────────────────────┐\n"
+            text += f"│ #{p[0]} | {p[2]} | {p[3]}\n"
+            text += f"│ 🔑 `{p[1]}`\n"
+            text += f"│ 📅 {p[4][:10]}\n"
+            text += f"└─────────────────────────────────┘\n\n"
+        
+        text += "\n🗑️ **ДЛЯ УДАЛЕНИЯ НАЖМИТЕ НА КНОПКУ НИЖЕ:**"
+        
+        await query.edit_message_text(
+            text,
+            reply_markup=passwords_keyboard(passwords),
+            parse_mode="Markdown"
+        )
+    
+    elif data.startswith("del_"):
+        password_id = int(data.split("_")[1])
+        delete_password(password_id, user_id)
+        await query.edit_message_text(
+            "✅ **ПАРОЛЬ УДАЛЁН!**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 МОИ ПАРОЛИ", callback_data="my_passwords")]])
+        )
+    
+    elif data == "check_password":
+        await query.edit_message_text(
+            "🔍 **ПРОВЕРКА ПАРОЛЯ**\n\n"
+            "✍️ **ВВЕДИТЕ ПАРОЛЬ, КОТОРЫЙ ХОТИТЕ ПРОВЕРИТЬ:**\n\n"
+            "⚠️ ПАРОЛЬ НЕ БУДЕТ СОХРАНЁН",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_check"] = True
+    
+    elif data == "tips":
+        tips = get_general_tips()
+        await query.edit_message_text(
+            "╔════════════════════════════════════════════╗\n"
+            "║  💡 **СОВЕТЫ ПО БЕЗОПАСНОСТИ**            ║\n"
+            "╠════════════════════════════════════════════╣\n"
+            f"║  {chr(10).join([f'• {t}' for t in tips])}  ║\n"
+            "╚════════════════════════════════════════════╝\n\n"
+            "🔐 **ДОПОЛНИТЕЛЬНЫЕ РЕКОМЕНДАЦИИ:**\n"
+            "• ИСПОЛЬЗУЙТЕ МЕНЕДЖЕРЫ ПАРОЛЕЙ\n"
+            "• РЕГУЛЯРНО ПРОВЕРЯЙТЕ УТЕЧКИ ДАННЫХ\n"
+            "• НЕ ИСПОЛЬЗУЙТЕ ОДИН ПАРОЛЬ ВЕЗДЕ",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "info":
+        await query.edit_message_text(
+            "╔════════════════════════════════════════════╗\n"
+            "║  ℹ️ **ИНФОРМАЦИЯ О БОТЕ**                 ║\n"
+            "╠════════════════════════════════════════════╣\n"
+            "║  🤖 PASSGEN v1.0                          ║\n"
+            "║  🔐 ГЕНЕРАТОР НАДЁЖНЫХ ПАРОЛЕЙ            ║\n"
+            "║  📱 ДЛЯ ЛЮБЫХ СЕРВИСОВ                    ║\n"
+            "║  💡 СОВЕТЫ ПО БЕЗОПАСНОСТИ                ║\n"
+            "║  📋 СОХРАНЕНИЕ ИСТОРИИ                    ║\n"
+            "╠════════════════════════════════════════════╣\n"
+            "║  🔒 БЕЗОПАСНОСТЬ:                         ║\n"
+            "║  • ПАРОЛИ НЕ ПЕРЕДАЮТСЯ ТРЕТЬИМ ЛИЦАМ     ║\n"
+            "║  • ХРАНЯТСЯ В ЗАШИФРОВАННОМ ВИДЕ          ║\n"
+            "║  • ВЫ МОЖЕТЕ УДАЛИТЬ ИХ В ЛЮБОЙ МОМЕНТ    ║\n"
+            "╚════════════════════════════════════════════╝",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    # Проверка пароля
+    if context.user_data.get("awaiting_check"):
+        password = text
+        strength, feedback, score = check_password_strength(password)
+        
+        feedback_text = "\n".join(feedback) if feedback else "✅ ВСЕ КРИТЕРИИ ВЫПОЛНЕНЫ!"
+        
+        await update.message.reply_text(
+            f"╔════════════════════════════════════════════╗\n"
+            f"║  🔍 **РЕЗУЛЬТАТ ПРОВЕРКИ**                ║\n"
+            f"╠════════════════════════════════════════════╣\n"
+            f"║  🔑 ПАРОЛЬ: `{password[:20]}...`           ║\n"
+            f"║  ⭐ НАДЁЖНОСТЬ: {strength}                 ║\n"
+            f"╠════════════════════════════════════════════╣\n"
+            f"║  📊 **ДЕТАЛИ:**                            ║\n"
+            f"║  {chr(10).join([f'║  {f}' for f in feedback])}  ║\n"
+            f"╠════════════════════════════════════════════╣\n"
+            f"║  💡 **СОВЕТ:**                             ║\n"
+            f"║  • ИСПОЛЬЗУЙТЕ РАЗНЫЕ ПАРОЛИ ДЛЯ РАЗНЫХ   ║\n"
+            f"║    СЕРВИСОВ                                ║\n"
+            f"║  • ВКЛЮЧИТЕ ДВУХФАКТОРНУЮ АУТЕНТИФИКАЦИЮ  ║\n"
+            f"╚════════════════════════════════════════════╝",
+            parse_mode="Markdown"
+        )
+        context.user_data["awaiting_check"] = False
+        return
+    
+    await update.message.reply_text(
+        "❓ ИСПОЛЬЗУЙ КНОПКИ МЕНЮ!",
+        reply_markup=main_keyboard()
+    )
+
+def main():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("🚀 PASSGEN БОТ ЗАПУЩЕН!")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
