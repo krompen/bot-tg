@@ -10,6 +10,7 @@ import re
 import sqlite3
 import random
 import datetime
+import socks
 import asyncio
 import logging
 from typing import Optional, Dict, Tuple
